@@ -2,6 +2,7 @@ import structlog
 from fastapi import FastAPI
 
 from app.routers.parse import router as parse_router
+from app.routers.price_check import router as price_check_router
 
 structlog.configure(
     processors=[
@@ -17,6 +18,7 @@ app = FastAPI(
 )
 
 app.include_router(parse_router)
+app.include_router(price_check_router)
 
 
 @app.get("/health")

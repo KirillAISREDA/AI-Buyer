@@ -29,6 +29,33 @@ export interface ParseInvoiceResponse {
   model: string;
 }
 
+export interface PriceCheckItemInput {
+  name: string;
+  price_per_unit: number;
+  quantity: number;
+  unit: string;
+}
+
+export interface ItemAssessmentResult {
+  name: string;
+  invoice_price: number;
+  market_price: number | null;
+  market_source: string | null;
+  history_avg_price: number | null;
+  market_deviation_pct: number | null;
+  history_deviation_pct: number | null;
+  supplier_change_pct: number | null;
+  assessment: string;
+  explanation: string;
+}
+
+export interface PriceCheckResponse {
+  success: boolean;
+  items: ItemAssessmentResult[];
+  error: string | null;
+  tokens_used: number;
+}
+
 @Injectable()
 export class AiClientService {
   private readonly logger = new Logger(AiClientService.name);
@@ -66,6 +93,38 @@ export class AiClientService {
 
     this.logger.log(
       `AI parse result: success=${result.success}, items=${result.data?.items?.length ?? 0}, tokens=${result.tokens_used}`,
+    );
+
+    return result;
+  }
+
+  async checkPrices(
+    items: PriceCheckItemInput[],
+    supplierName?: string,
+  ): Promise<PriceCheckResponse> {
+    const body = {
+      items,
+      supplier_name: supplierName ?? null,
+      history: {},
+    };
+
+    this.logger.log(`Calling AI service: check-prices for ${items.length} items`);
+
+    const response = await fetch(`${this.baseUrl}/api/v1/check-prices`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`AI service error ${response.status}: ${text}`);
+    }
+
+    const result: PriceCheckResponse = await response.json();
+
+    this.logger.log(
+      `Price check result: success=${result.success}, items=${result.items?.length ?? 0}`,
     );
 
     return result;

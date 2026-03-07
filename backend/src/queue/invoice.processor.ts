@@ -7,7 +7,8 @@ import { Invoice } from '../invoices/invoice.entity.js';
 import { InvoiceItem } from '../invoices/invoice-item.entity.js';
 import { InvoiceStatus } from '../common/enums/invoice-status.enum.js';
 import { StorageService } from '../storage/storage.service.js';
-import { AiClientService } from '../ai-client/ai-client.service.js';
+import { AiClientService, PriceCheckItemInput } from '../ai-client/ai-client.service.js';
+import { ItemAssessment } from '../invoices/invoice-item.entity.js';
 
 export const INVOICE_QUEUE = 'invoice-processing';
 
@@ -89,6 +90,59 @@ export class InvoiceProcessor extends WorkerHost {
       this.logger.log(
         `Invoice ${invoiceId} parsed: ${parsed.items?.length ?? 0} items, total=${parsed.total}`,
       );
+
+      // 7. Price checking
+      await this.invoiceRepository.update(invoiceId, {
+        status: InvoiceStatus.CHECKING,
+      });
+
+      const savedItems = await this.itemRepository.find({ where: { invoiceId } });
+
+      if (savedItems.length > 0) {
+        const priceCheckItems: PriceCheckItemInput[] = savedItems.map((item) => ({
+          name: item.name,
+          price_per_unit: Number(item.pricePerUnit),
+          quantity: Number(item.quantity),
+          unit: item.unit,
+        }));
+
+        const priceResult = await this.aiClientService.checkPrices(
+          priceCheckItems,
+          parsed.supplier?.name ?? undefined,
+        );
+
+        if (priceResult.success && priceResult.items.length > 0) {
+          // Match assessments to saved items by name
+          const assessmentMap = new Map(
+            priceResult.items.map((a) => [a.name.toLowerCase(), a]),
+          );
+
+          for (const item of savedItems) {
+            const assessment = assessmentMap.get(item.name.toLowerCase());
+            if (assessment) {
+              await this.itemRepository.update(item.id, {
+                marketPrice: assessment.market_price ?? undefined,
+                marketSource: assessment.market_source ?? undefined,
+                historyAvgPrice: assessment.history_avg_price ?? undefined,
+                marketDeviationPct: assessment.market_deviation_pct ?? undefined,
+                historyDeviationPct: assessment.history_deviation_pct ?? undefined,
+                assessment: (assessment.assessment as ItemAssessment) ?? undefined,
+                assessmentExplanation: assessment.explanation ?? undefined,
+              });
+            }
+          }
+
+          this.logger.log(
+            `Invoice ${invoiceId} price-checked: ${priceResult.items.length} assessments`,
+          );
+        }
+      }
+
+      // 8. Mark as done
+      await this.invoiceRepository.update(invoiceId, {
+        status: InvoiceStatus.DONE,
+      });
+
     } catch (error) {
       this.logger.error(`Failed to process invoice ${invoiceId}`, error);
       await this.invoiceRepository.update(invoiceId, {
