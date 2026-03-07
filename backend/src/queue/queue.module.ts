@@ -4,6 +4,9 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { InvoiceProcessor, INVOICE_QUEUE } from './invoice.processor.js';
 import { Invoice } from '../invoices/invoice.entity.js';
+import { InvoiceItem } from '../invoices/invoice-item.entity.js';
+import { StorageModule } from '../storage/storage.module.js';
+import { AiClientModule } from '../ai-client/ai-client.module.js';
 
 @Module({
   imports: [
@@ -22,7 +25,9 @@ import { Invoice } from '../invoices/invoice.entity.js';
       },
     }),
     BullModule.registerQueue({ name: INVOICE_QUEUE }),
-    TypeOrmModule.forFeature([Invoice]),
+    TypeOrmModule.forFeature([Invoice, InvoiceItem]),
+    StorageModule,
+    AiClientModule,
   ],
   providers: [InvoiceProcessor],
   exports: [BullModule],
