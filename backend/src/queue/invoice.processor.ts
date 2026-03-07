@@ -9,6 +9,7 @@ import { InvoiceStatus } from '../common/enums/invoice-status.enum.js';
 import { StorageService } from '../storage/storage.service.js';
 import { AiClientService, PriceCheckItemInput } from '../ai-client/ai-client.service.js';
 import { ItemAssessment } from '../invoices/invoice-item.entity.js';
+import { NotificationsService } from '../notifications/notifications.service.js';
 
 export const INVOICE_QUEUE = 'invoice-processing';
 
@@ -27,6 +28,7 @@ export class InvoiceProcessor extends WorkerHost {
     private itemRepository: Repository<InvoiceItem>,
     private storageService: StorageService,
     private aiClientService: AiClientService,
+    private notificationsService: NotificationsService,
   ) {
     super();
   }
@@ -138,7 +140,12 @@ export class InvoiceProcessor extends WorkerHost {
         }
       }
 
-      // 8. Mark as done
+      // 8. Send notifications
+      const finalItems = await this.itemRepository.find({ where: { invoiceId } });
+      const finalInvoice = await this.invoiceRepository.findOneByOrFail({ id: invoiceId });
+      await this.notificationsService.notifyInvoiceProcessed(finalInvoice, finalItems);
+
+      // 9. Mark as done
       await this.invoiceRepository.update(invoiceId, {
         status: InvoiceStatus.DONE,
       });

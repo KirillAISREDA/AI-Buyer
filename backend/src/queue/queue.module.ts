@@ -7,6 +7,7 @@ import { Invoice } from '../invoices/invoice.entity.js';
 import { InvoiceItem } from '../invoices/invoice-item.entity.js';
 import { StorageModule } from '../storage/storage.module.js';
 import { AiClientModule } from '../ai-client/ai-client.module.js';
+import { NotificationsModule } from '../notifications/notifications.module.js';
 
 @Module({
   imports: [
@@ -28,6 +29,7 @@ import { AiClientModule } from '../ai-client/ai-client.module.js';
     TypeOrmModule.forFeature([Invoice, InvoiceItem]),
     StorageModule,
     AiClientModule,
+    NotificationsModule,
   ],
   providers: [InvoiceProcessor],
   exports: [BullModule],
