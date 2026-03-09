@@ -1,3 +1,4 @@
+import asyncio
 import json
 import re
 import structlog
@@ -15,11 +16,13 @@ WEB_SEARCH_PROMPT = """Найди актуальные цены в России 
 {items_text}
 
 Для каждого товара верни:
-- name: название товара (как в запросе)
-- market_price: цена за единицу в рублях (число)
+- name: название товара (ТОЧНО как в запросе, не меняй)
+- market_price: средняя цена за единицу в рублях (число, не 0)
 - unit: единица измерения
-- source: прямая ссылка (URL) на страницу товара или поисковую выдачу
+- source: прямая ссылка (URL) на страницу товара
 - confidence: уверенность 0-1
+
+ВАЖНО: используй name ТОЧНО как указано в списке товаров выше, без изменений.
 
 Верни СТРОГО JSON:
 {{
@@ -36,6 +39,9 @@ WEB_SEARCH_PROMPT = """Найди актуальные цены в России 
 
 Верни ТОЛЬКО JSON."""
 
+# Timeout for web search API call (seconds)
+WEB_SEARCH_TIMEOUT = 120
+
 
 async def search_market_prices(
     items: list[dict],
@@ -47,10 +53,15 @@ async def search_market_prices(
     )
 
     try:
-        return await _search_openai_web(items_text, len(items))
+        return await asyncio.wait_for(
+            _search_openai_web(items_text, len(items)),
+            timeout=WEB_SEARCH_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("openai_web_search_timeout", timeout=WEB_SEARCH_TIMEOUT)
+        return await _search_openai_fallback(items_text, len(items))
     except Exception as e:
         logger.warning("openai_web_search_failed", error=str(e))
-        # Fallback to regular GPT without web search
         return await _search_openai_fallback(items_text, len(items))
 
 
@@ -60,13 +71,12 @@ async def _search_openai_web(
 ) -> tuple[list[dict], int]:
     """Search prices via OpenAI Responses API with web_search tool."""
     llm = get_client()
-    model = settings.openai_model
     prompt = WEB_SEARCH_PROMPT.format(items_text=items_text)
 
-    logger.info("openai_web_search_request", model=model, items_count=items_count)
+    logger.info("openai_web_search_request", model="gpt-4o-mini", items_count=items_count)
 
     response = await llm.responses.create(
-        model=model,
+        model="gpt-4o-mini",
         tools=[
             {
                 "type": "web_search_preview",
@@ -104,10 +114,6 @@ async def _search_openai_web(
         content_len=len(content_text),
         urls_count=len(urls),
         tokens=tokens,
-    )
-
-    logger.info(
-        "openai_web_search_raw_content",
         content_preview=content_text[:500],
     )
 
@@ -115,6 +121,7 @@ async def _search_openai_web(
 
     logger.info(
         "openai_web_search_parsed",
+        prices_count=len(prices),
         sample_prices=[
             {k: v for k, v in p.items() if k in ("name", "market_price", "source")}
             for p in prices[:3]
@@ -126,7 +133,6 @@ async def _search_openai_web(
         for i, price in enumerate(prices):
             source = price.get("source", "")
             if not source or not source.startswith("http"):
-                # Assign URL from annotations round-robin
                 price["source"] = urls[i % len(urls)]
 
     logger.info(
