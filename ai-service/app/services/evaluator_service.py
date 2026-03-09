@@ -46,16 +46,39 @@ async def evaluate_prices(request: PriceCheckRequest) -> PriceCheckResponse:
 
         market_prices, tokens = await search_market_prices(items_for_search)
 
-        # Build lookup by name (case-insensitive)
+        # Build lookup by name (case-insensitive, stripped)
         market_lookup: dict[str, dict] = {}
         for mp in market_prices:
-            market_lookup[mp["name"].lower()] = mp
+            market_lookup[mp["name"].lower().strip()] = mp
+
+        logger.info(
+            "market_lookup_keys",
+            keys=list(market_lookup.keys())[:5],
+        )
 
         # 2. Evaluate each item
         assessments: list[ItemAssessment] = []
-        for item in request.items:
+        for idx, item in enumerate(request.items):
             history = request.history.get(item.name, HistoryData())
-            market_info = market_lookup.get(item.name.lower(), {})
+            item_key = item.name.lower().strip()
+            market_info = market_lookup.get(item_key, {})
+
+            # Fuzzy fallback: try to find a partial match if exact fails
+            if not market_info:
+                for mk, mv in market_lookup.items():
+                    if mk in item_key or item_key in mk:
+                        market_info = mv
+                        break
+                    item_words = set(item_key.split()[:3])
+                    mk_words = set(mk.split()[:3])
+                    if len(item_words & mk_words) >= 2:
+                        market_info = mv
+                        break
+
+            # Index-based fallback: match by position if counts match
+            if not market_info and idx < len(market_prices):
+                market_info = market_prices[idx]
+                logger.info("index_match_fallback", item=item.name, matched=market_info.get("name", ""))
             market_price = market_info.get("market_price")
             market_source = market_info.get("source")
 

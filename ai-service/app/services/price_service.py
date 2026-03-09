@@ -106,7 +106,20 @@ async def _search_openai_web(
         tokens=tokens,
     )
 
+    logger.info(
+        "openai_web_search_raw_content",
+        content_preview=content_text[:500],
+    )
+
     prices = _parse_prices_json(content_text)
+
+    logger.info(
+        "openai_web_search_parsed",
+        sample_prices=[
+            {k: v for k, v in p.items() if k in ("name", "market_price", "source")}
+            for p in prices[:3]
+        ],
+    )
 
     # Enrich sources with real URLs from annotations
     if urls:
