@@ -48,8 +48,8 @@ async def search_market_prices(
 ) -> tuple[list[dict], int]:
     """Search real market prices via OpenAI web search tool."""
     items_text = "\n".join(
-        f"- {item['name']}: {item['quantity']} {item['unit']} по {item['price_per_unit']} руб."
-        for item in items
+        f"{i+1}. {item['name']} (единица: {item['unit']})"
+        for i, item in enumerate(items)
     )
 
     try:

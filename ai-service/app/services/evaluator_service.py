@@ -22,12 +22,13 @@ def _assess(market_dev: float | None, history_dev: float | None) -> str:
     dev = market_dev if market_dev is not None else history_dev
     if dev is None:
         return "unknown"
-    abs_dev = abs(dev)
-    if abs_dev < 10:
-        return "ok"
-    if abs_dev < 25:
+    # Only flag as overpriced when invoice price is ABOVE market
+    if dev > 25:
+        return "overpriced"
+    if dev > 10:
         return "attention"
-    return "overpriced"
+    # Price is at or below market — good deal
+    return "ok"
 
 
 async def evaluate_prices(request: PriceCheckRequest) -> PriceCheckResponse:
