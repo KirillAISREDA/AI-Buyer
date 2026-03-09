@@ -3,14 +3,13 @@ import structlog
 
 from app.models.invoice import ParseInvoiceRequest, ParseInvoiceResponse
 from app.services.ocr_service import (
-    extract_text_from_image,
     extract_text_from_pdf,
 )
 from app.services.document_service import (
     extract_text_from_docx,
     extract_text_from_xlsx,
 )
-from app.services.llm_service import extract_invoice_data
+from app.services.llm_service import extract_invoice_data, extract_invoice_data_vision
 
 logger = structlog.get_logger()
 
@@ -25,7 +24,7 @@ MIME_XLSX = {
 
 
 async def parse_invoice(request: ParseInvoiceRequest) -> ParseInvoiceResponse:
-    """Full parsing pipeline: decode → extract text → LLM → structured data."""
+    """Full parsing pipeline: decode → extract/vision → LLM → structured data."""
     try:
         file_bytes = base64.b64decode(request.file_content_base64)
         mime = request.mime_type.lower()
@@ -37,10 +36,30 @@ async def parse_invoice(request: ParseInvoiceRequest) -> ParseInvoiceResponse:
             size=len(file_bytes),
         )
 
-        # Extract text based on file type
+        # Images: send directly to GPT-4o Vision (much better for tables)
         if mime in MIME_IMAGE:
-            raw_text = extract_text_from_image(file_bytes)
-        elif mime in MIME_PDF:
+            parsed, tokens, model = await extract_invoice_data_vision(
+                file_bytes, mime,
+            )
+
+            logger.info(
+                "parsing_completed",
+                method="vision",
+                items_count=len(parsed.items),
+                total=parsed.total,
+                confidence=parsed.confidence,
+            )
+
+            return ParseInvoiceResponse(
+                success=True,
+                data=parsed,
+                raw_text="[parsed via GPT-4o Vision]",
+                tokens_used=tokens,
+                model=model,
+            )
+
+        # Other file types: extract text first, then send to LLM
+        if mime in MIME_PDF:
             raw_text = extract_text_from_pdf(file_bytes)
         elif mime in MIME_DOCX:
             raw_text = extract_text_from_docx(file_bytes)
@@ -64,6 +83,7 @@ async def parse_invoice(request: ParseInvoiceRequest) -> ParseInvoiceResponse:
 
         logger.info(
             "parsing_completed",
+            method="text",
             items_count=len(parsed.items),
             total=parsed.total,
             confidence=parsed.confidence,
