@@ -1,126 +1,141 @@
 import json
+import re
 import structlog
-import httpx
 
+from openai import AsyncOpenAI
 from app.config import settings
 from app.services.llm_service import get_client
-from app.prompts.evaluate_price import PRICE_SEARCH_PROMPT
 
 logger = structlog.get_logger()
 
-PERPLEXITY_API_URL = "https://api.perplexity.ai/chat/completions"
-
-PERPLEXITY_PRICE_PROMPT = """Найди актуальные розничные и оптовые цены в России для следующих товаров.
-Ищи на Яндекс.Маркете, Ozon, Леруа Мерлен, Петрович, и других строительных/торговых площадках.
+WEB_SEARCH_PROMPT = """Найди актуальные цены в России на следующие товары.
+Ищи на реальных торговых площадках: Яндекс.Маркет, Ozon, Wildberries, Леруа Мерлен, Петрович, ВсеИнструменты и др.
 
 Товары:
 {items_text}
 
-Для каждого товара укажи:
-- Найденную рыночную цену за единицу (в рублях)
-- Источник (название сайта/магазина)
-- Насколько ты уверен в цене (0-1)
+Для каждого товара верни:
+- name: название товара (как в запросе)
+- market_price: цена за единицу в рублях (число)
+- unit: единица измерения
+- source: прямая ссылка (URL) на страницу товара или поисковую выдачу
+- confidence: уверенность 0-1
 
 Верни СТРОГО JSON:
 {{
   "prices": [
     {{
-      "name": "название товара как в запросе",
+      "name": "...",
       "market_price": 0,
-      "unit": "единица",
-      "source": "название магазина/площадки",
+      "unit": "шт",
+      "source": "https://...",
       "confidence": 0.8
     }}
   ]
 }}
 
-Верни ТОЛЬКО JSON, без пояснений."""
+Верни ТОЛЬКО JSON."""
 
 
 async def search_market_prices(
     items: list[dict],
 ) -> tuple[list[dict], int]:
-    """Search market prices using Perplexity API (web search) with GPT-4o fallback."""
+    """Search real market prices via OpenAI web search tool."""
     items_text = "\n".join(
         f"- {item['name']}: {item['quantity']} {item['unit']} по {item['price_per_unit']} руб."
         for item in items
     )
 
-    if settings.perplexity_api_key:
-        try:
-            return await _search_perplexity(items_text, len(items))
-        except Exception as e:
-            logger.warning("perplexity_failed_fallback_to_openai", error=str(e))
+    try:
+        return await _search_openai_web(items_text, len(items))
+    except Exception as e:
+        logger.warning("openai_web_search_failed", error=str(e))
+        # Fallback to regular GPT without web search
+        return await _search_openai_fallback(items_text, len(items))
 
-    return await _search_openai(items_text, len(items))
 
-
-async def _search_perplexity(
+async def _search_openai_web(
     items_text: str,
     items_count: int,
 ) -> tuple[list[dict], int]:
-    """Search prices via Perplexity API (real web search)."""
-    prompt = PERPLEXITY_PRICE_PROMPT.format(items_text=items_text)
-    model = settings.perplexity_model
+    """Search prices via OpenAI Responses API with web_search tool."""
+    llm = get_client()
+    model = settings.openai_model
+    prompt = WEB_SEARCH_PROMPT.format(items_text=items_text)
 
-    logger.info("perplexity_price_search", model=model, items_count=items_count)
+    logger.info("openai_web_search_request", model=model, items_count=items_count)
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        response = await client.post(
-            PERPLEXITY_API_URL,
-            headers={
-                "Authorization": f"Bearer {settings.perplexity_api_key}",
-                "Content-Type": "application/json",
+    response = await llm.responses.create(
+        model=model,
+        tools=[
+            {
+                "type": "web_search_preview",
+                "search_context_size": "medium",
+                "user_location": {
+                    "type": "approximate",
+                    "country": "RU",
+                },
             },
-            json={
-                "model": model,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "Ты помощник по поиску цен на товары в России. Используй веб-поиск для нахождения актуальных цен.",
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                "temperature": 0.1,
-            },
-        )
-        response.raise_for_status()
-        result = response.json()
+        ],
+        instructions="Ты аналитик закупок. Используй веб-поиск чтобы найти реальные цены на товары в российских интернет-магазинах. Возвращай результат в JSON.",
+        input=prompt,
+        temperature=0.1,
+    )
 
-    content = result["choices"][0]["message"]["content"]
-    tokens = result.get("usage", {}).get("total_tokens", 0)
+    # Extract text content and URL citations from response
+    content_text = ""
+    urls: list[str] = []
 
-    # Extract JSON from response (Perplexity may wrap it in markdown)
-    prices = _parse_prices_json(content)
+    for item in response.output:
+        if item.type == "message":
+            for block in item.content:
+                if block.type == "output_text":
+                    content_text = block.text
+                    # Collect annotation URLs
+                    if hasattr(block, "annotations") and block.annotations:
+                        for ann in block.annotations:
+                            if hasattr(ann, "url") and ann.url:
+                                urls.append(ann.url)
 
-    citations = result["choices"][0]["message"].get("citations", [])
-    if citations:
-        logger.info("perplexity_citations", count=len(citations), sources=citations[:5])
-
-    # Enrich sources with citations if available
-    if citations:
-        for price in prices:
-            if not price.get("source") or price["source"] in ("", "unknown"):
-                price["source"] = citations[0] if citations else "web search"
+    tokens = response.usage.total_tokens if response.usage else 0
 
     logger.info(
-        "perplexity_price_result",
-        prices_count=len(prices),
+        "openai_web_search_response",
+        content_len=len(content_text),
+        urls_count=len(urls),
         tokens=tokens,
     )
+
+    prices = _parse_prices_json(content_text)
+
+    # Enrich sources with real URLs from annotations
+    if urls:
+        for i, price in enumerate(prices):
+            source = price.get("source", "")
+            if not source or not source.startswith("http"):
+                # Assign URL from annotations round-robin
+                price["source"] = urls[i % len(urls)]
+
+    logger.info(
+        "openai_web_search_result",
+        prices_count=len(prices),
+        tokens=tokens,
+        sample_sources=[p.get("source", "")[:80] for p in prices[:3]],
+    )
+
     return prices, tokens
 
 
-async def _search_openai(
+async def _search_openai_fallback(
     items_text: str,
     items_count: int,
 ) -> tuple[list[dict], int]:
-    """Fallback: search prices via OpenAI GPT (from model knowledge)."""
+    """Fallback: search prices via OpenAI Chat without web search."""
     llm = get_client()
     model = settings.openai_model
-    prompt = PRICE_SEARCH_PROMPT.format(items_text=items_text)
+    prompt = WEB_SEARCH_PROMPT.format(items_text=items_text)
 
-    logger.info("openai_price_search_fallback", model=model, items_count=items_count)
+    logger.info("openai_fallback_search", model=model, items_count=items_count)
 
     response = await llm.chat.completions.create(
         model=model,
@@ -137,26 +152,24 @@ async def _search_openai(
     data = json.loads(content)
     prices = data.get("prices", [])
 
-    # Mark source as model knowledge
     for price in prices:
-        if not price.get("source"):
-            price["source"] = "GPT-4o (оценка)"
+        if not price.get("source") or not price["source"].startswith("http"):
+            price["source"] = "GPT-4o (оценка, без веб-поиска)"
 
-    logger.info("openai_price_result", prices_count=len(prices), tokens=tokens)
+    logger.info("openai_fallback_result", prices_count=len(prices), tokens=tokens)
     return prices, tokens
 
 
 def _parse_prices_json(content: str) -> list[dict]:
-    """Parse JSON from Perplexity response, handling markdown code blocks."""
-    # Try direct JSON parse
+    """Parse JSON from response, handling markdown code blocks."""
+    # Try direct parse
     try:
         data = json.loads(content)
         return data.get("prices", [])
     except json.JSONDecodeError:
         pass
 
-    # Try extracting from markdown code block
-    import re
+    # Try markdown code block
     match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
     if match:
         try:
@@ -175,5 +188,5 @@ def _parse_prices_json(content: str) -> list[dict]:
         except json.JSONDecodeError:
             pass
 
-    logger.warning("failed_to_parse_prices_json", content_preview=content[:200])
+    logger.warning("failed_to_parse_prices_json", content_preview=content[:300])
     return []
