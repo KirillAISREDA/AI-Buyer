@@ -1,167 +1,227 @@
+"""Price search via OpenAI web search model.
+
+Uses gpt-4o-mini-search-preview with web_search_options for real
+internet price search. Since search models don't support
+response_format: json_object, the raw response with url_citation
+annotations is parsed in a second step by gpt-4o-mini.
+"""
+
 import asyncio
 import json
 import re
 import structlog
 
-from openai import AsyncOpenAI
 from app.config import settings
 from app.services.llm_service import get_client
+from app.models.price_check import NormalizedItem
 
 logger = structlog.get_logger()
 
-WEB_SEARCH_PROMPT = """Найди актуальные цены в России на следующие товары.
-Ищи на реальных торговых площадках: Яндекс.Маркет, Ozon, Wildberries, Леруа Мерлен, Петрович, ВсеИнструменты и др.
+WEB_SEARCH_TIMEOUT = 120
 
-Товары:
+WEB_SEARCH_PROMPT = """Найди актуальные цены в России на следующие товары.
+Ищи на реальных торговых площадках: Яндекс.Маркет, Ozon, Wildberries,
+Леруа Мерлен, Петрович, ВсеИнструменты, pulscen.ru и др.
+
+Товары для поиска:
 {items_text}
 
-Для каждого товара верни:
-- name: название товара (ТОЧНО как в запросе, не меняй)
-- market_price: средняя цена за единицу в рублях (число, не 0)
-- unit: единица измерения
-- source: прямая ссылка (URL) на страницу товара
-- confidence: уверенность 0-1
+Для каждого товара укажи:
+- Название товара
+- Найденную цену за единицу в рублях
+- Единицу измерения
+- URL источника
+- Название продавца/магазина
 
-ВАЖНО: используй name ТОЧНО как указано в списке товаров выше, без изменений.
+Если нашёл аналог или заменитель дешевле — тоже укажи.
+Приведи конкретные цены и ссылки."""
 
-Верни СТРОГО JSON:
+EXTRACT_JSON_PROMPT = """Из текста ниже извлеки структурированные данные о ценах.
+Для каждого товара из списка найди все упомянутые цены и источники.
+
+Список товаров (используй эти названия ТОЧНО):
+{items_names}
+
+Текст с ценами и ссылками:
+{search_result}
+
+Аннотации (реальные URL из поиска):
+{annotations}
+
+Верни JSON:
 {{
   "prices": [
     {{
-      "name": "...",
-      "market_price": 0,
+      "name": "название товара ТОЧНО из списка",
+      "market_prices": [
+        {{"price": 123.0, "url": "https://...", "seller": "название магазина"}}
+      ],
       "unit": "шт",
-      "source": "https://...",
-      "confidence": 0.8
+      "analog": {{
+        "name": "название аналога",
+        "price": 100.0,
+        "url": "https://..."
+      }}
     }}
   ]
 }}
 
+Правила:
+- name должен ТОЧНО совпадать с одним из товаров в списке
+- market_prices — массив ВСЕХ найденных цен из разных источников
+- url — реальная ссылка из аннотаций, НЕ выдуманная
+- analog — только если найден реальный более дешёвый аналог/заменитель
+- Если для товара ничего не найдено, всё равно включи его с пустым market_prices
+
 Верни ТОЛЬКО JSON."""
 
-# Timeout for web search API call (seconds)
-WEB_SEARCH_TIMEOUT = 120
 
-
-async def search_market_prices(
-    items: list[dict],
+async def search_web_prices(
+    normalized_items: list[NormalizedItem],
 ) -> tuple[list[dict], int]:
-    """Search real market prices via OpenAI web search tool."""
+    """Search prices via gpt-4o-mini-search-preview + extraction step.
+
+    Step 1: Web search with search model (returns text + url_citation)
+    Step 2: Extract structured JSON via gpt-4o-mini
+
+    Returns (prices_list, total_tokens).
+    """
+    # Build search query from normalized items
     items_text = "\n".join(
-        f"{i+1}. {item['name']} (единица: {item['unit']})"
-        for i, item in enumerate(items)
+        f"- {ni.normalized_name} (единица: {ni.unit})"
+        + (f"\n  Доп. запросы: {', '.join(ni.search_queries)}" if ni.search_queries else "")
+        for ni in normalized_items
     )
+
+    total_tokens = 0
 
     try:
-        return await asyncio.wait_for(
-            _search_openai_web(items_text, len(items)),
+        raw_text, annotations, t1 = await asyncio.wait_for(
+            _step1_web_search(items_text, len(normalized_items)),
             timeout=WEB_SEARCH_TIMEOUT,
         )
+        total_tokens += t1
+
+        if not raw_text:
+            logger.warning("web_search_empty_response")
+            return [], total_tokens
+
+        items_names = json.dumps(
+            [ni.original_name for ni in normalized_items],
+            ensure_ascii=False,
+        )
+        prices, t2 = await _step2_extract_json(
+            raw_text, annotations, items_names
+        )
+        total_tokens += t2
+
+        return prices, total_tokens
+
     except asyncio.TimeoutError:
-        logger.warning("openai_web_search_timeout", timeout=WEB_SEARCH_TIMEOUT)
-        return await _search_openai_fallback(items_text, len(items))
+        logger.warning("web_search_timeout", timeout=WEB_SEARCH_TIMEOUT)
+        return await _fallback_search(normalized_items)
     except Exception as e:
-        logger.warning("openai_web_search_failed", error=str(e))
-        return await _search_openai_fallback(items_text, len(items))
+        logger.warning("web_search_failed", error=str(e))
+        return await _fallback_search(normalized_items)
 
 
-async def _search_openai_web(
+async def _step1_web_search(
     items_text: str,
     items_count: int,
-) -> tuple[list[dict], int]:
-    """Search prices via OpenAI Responses API with web_search tool."""
+) -> tuple[str, list[dict], int]:
+    """Step 1: Call gpt-4o-mini-search-preview with web_search_options.
+
+    Returns (response_text, annotations_list, tokens).
+    """
     llm = get_client()
+    model = settings.openai_search_model
     prompt = WEB_SEARCH_PROMPT.format(items_text=items_text)
 
-    logger.info("openai_web_search_request", model="gpt-4o-mini", items_count=items_count)
+    logger.info("web_search_step1", model=model, items_count=items_count)
 
     response = await llm.responses.create(
-        model="gpt-4o-mini",
-        tools=[
-            {
-                "type": "web_search_preview",
-                "search_context_size": "medium",
-                "user_location": {
-                    "type": "approximate",
-                    "country": "RU",
-                },
+        model=model,
+        web_search_options={
+            "search_context_size": "medium",
+            "user_location": {
+                "type": "approximate",
+                "country": "RU",
             },
-        ],
-        instructions="Ты аналитик закупок. Используй веб-поиск чтобы найти реальные цены на товары в российских интернет-магазинах. Возвращай результат в JSON.",
+        },
+        instructions=(
+            "Ты аналитик закупок. Используй веб-поиск чтобы найти "
+            "реальные цены на товары в российских интернет-магазинах. "
+            "Приведи конкретные цены, ссылки и названия магазинов."
+        ),
         input=prompt,
-        temperature=0.1,
+        temperature=0.2,
     )
 
-    # Extract text content and URL citations from response
+    # Extract text and url_citation annotations
     content_text = ""
-    urls: list[str] = []
+    annotations: list[dict] = []
 
     for item in response.output:
         if item.type == "message":
             for block in item.content:
                 if block.type == "output_text":
-                    content_text = block.text
-                    # Collect annotation URLs
+                    content_text += block.text
                     if hasattr(block, "annotations") and block.annotations:
                         for ann in block.annotations:
+                            ann_data: dict = {"type": getattr(ann, "type", "")}
                             if hasattr(ann, "url") and ann.url:
-                                urls.append(ann.url)
+                                ann_data["url"] = ann.url
+                            if hasattr(ann, "title") and ann.title:
+                                ann_data["title"] = ann.title
+                            if hasattr(ann, "start_index"):
+                                ann_data["start_index"] = ann.start_index
+                            if hasattr(ann, "end_index"):
+                                ann_data["end_index"] = ann.end_index
+                            annotations.append(ann_data)
 
     tokens = response.usage.total_tokens if response.usage else 0
 
     logger.info(
-        "openai_web_search_response",
+        "web_search_step1_result",
         content_len=len(content_text),
-        urls_count=len(urls),
+        annotations_count=len(annotations),
         tokens=tokens,
-        content_preview=content_text[:500],
+        content_preview=content_text[:300],
+        sample_urls=[a.get("url", "")[:80] for a in annotations[:5]],
     )
 
-    prices = _parse_prices_json(content_text)
-
-    logger.info(
-        "openai_web_search_parsed",
-        prices_count=len(prices),
-        sample_prices=[
-            {k: v for k, v in p.items() if k in ("name", "market_price", "source")}
-            for p in prices[:3]
-        ],
-    )
-
-    # Enrich sources with real URLs from annotations
-    if urls:
-        for i, price in enumerate(prices):
-            source = price.get("source", "")
-            if not source or not source.startswith("http"):
-                price["source"] = urls[i % len(urls)]
-
-    logger.info(
-        "openai_web_search_result",
-        prices_count=len(prices),
-        tokens=tokens,
-        sample_sources=[p.get("source", "")[:80] for p in prices[:3]],
-    )
-
-    return prices, tokens
+    return content_text, annotations, tokens
 
 
-async def _search_openai_fallback(
-    items_text: str,
-    items_count: int,
+async def _step2_extract_json(
+    search_result: str,
+    annotations: list[dict],
+    items_names: str,
 ) -> tuple[list[dict], int]:
-    """Fallback: search prices via OpenAI Chat without web search."""
-    llm = get_client()
-    model = settings.openai_model
-    prompt = WEB_SEARCH_PROMPT.format(items_text=items_text)
+    """Step 2: Extract structured JSON from search results via gpt-4o-mini.
 
-    logger.info("openai_fallback_search", model=model, items_count=items_count)
+    The search model can't return structured JSON, so we use a fast model
+    to parse the free-text results + annotations into our schema.
+    """
+    llm = get_client()
+    model = settings.openai_fast_model
+
+    annotations_text = json.dumps(annotations, ensure_ascii=False, indent=None)
+    if len(annotations_text) > 4000:
+        annotations_text = annotations_text[:4000] + "..."
+
+    prompt = EXTRACT_JSON_PROMPT.format(
+        items_names=items_names,
+        search_result=search_result[:6000],
+        annotations=annotations_text,
+    )
+
+    logger.info("web_search_step2", model=model)
 
     response = await llm.chat.completions.create(
         model=model,
-        messages=[
-            {"role": "system", "content": prompt},
-        ],
-        temperature=0.2,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.1,
         response_format={"type": "json_object"},
     )
 
@@ -171,41 +231,72 @@ async def _search_openai_fallback(
     data = json.loads(content)
     prices = data.get("prices", [])
 
-    for price in prices:
-        if not price.get("source") or not price["source"].startswith("http"):
-            price["source"] = "GPT-4o (оценка, без веб-поиска)"
+    logger.info(
+        "web_search_step2_result",
+        prices_count=len(prices),
+        tokens=tokens,
+        sample=[
+            {
+                "name": p.get("name", "")[:40],
+                "n_prices": len(p.get("market_prices", [])),
+                "has_analog": bool(p.get("analog")),
+            }
+            for p in prices[:3]
+        ],
+    )
 
-    logger.info("openai_fallback_result", prices_count=len(prices), tokens=tokens)
     return prices, tokens
 
 
-def _parse_prices_json(content: str) -> list[dict]:
-    """Parse JSON from response, handling markdown code blocks."""
-    # Try direct parse
-    try:
-        data = json.loads(content)
-        return data.get("prices", [])
-    except json.JSONDecodeError:
-        pass
+async def _fallback_search(
+    normalized_items: list[NormalizedItem],
+) -> tuple[list[dict], int]:
+    """Fallback: use gpt-4o-mini without web search for price estimates."""
+    llm = get_client()
+    model = settings.openai_fast_model
 
-    # Try markdown code block
-    match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
-    if match:
-        try:
-            data = json.loads(match.group(1))
-            return data.get("prices", [])
-        except json.JSONDecodeError:
-            pass
+    items_text = "\n".join(
+        f"- {ni.original_name} (единица: {ni.unit})"
+        for ni in normalized_items
+    )
 
-    # Try finding JSON object in text
-    start = content.find("{")
-    end = content.rfind("}") + 1
-    if start >= 0 and end > start:
-        try:
-            data = json.loads(content[start:end])
-            return data.get("prices", [])
-        except json.JSONDecodeError:
-            pass
+    prompt = f"""Оцени рыночные цены в России на эти товары (приблизительно):
+{items_text}
 
-    logger.warning("failed_to_parse_prices_json", content_preview=content[:300])
-    return []
+Верни JSON:
+{{
+  "prices": [
+    {{
+      "name": "...",
+      "market_prices": [{{"price": 123.0, "url": "", "seller": "оценка GPT"}}],
+      "unit": "шт"
+    }}
+  ]
+}}
+
+Верни ТОЛЬКО JSON."""
+
+    logger.info("fallback_search", model=model, items_count=len(normalized_items))
+
+    response = await llm.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.3,
+        response_format={"type": "json_object"},
+    )
+
+    content = response.choices[0].message.content or "{}"
+    tokens = response.usage.total_tokens if response.usage else 0
+
+    data = json.loads(content)
+    prices = data.get("prices", [])
+
+    # Mark fallback sources
+    for p in prices:
+        for mp in p.get("market_prices", []):
+            if not mp.get("url"):
+                mp["seller"] = "GPT (оценка, без веб-поиска)"
+                mp["url"] = ""
+
+    logger.info("fallback_result", prices_count=len(prices), tokens=tokens)
+    return prices, tokens
