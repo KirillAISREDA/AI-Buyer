@@ -5,6 +5,6 @@ export const getDatabaseConfig = (configService: ConfigService): TypeOrmModuleOp
   type: 'postgres',
   url: configService.get<string>('DATABASE_URL'),
   autoLoadEntities: true,
-  synchronize: configService.get<string>('NODE_ENV') !== 'production',
+  synchronize: true,
   logging: configService.get<string>('NODE_ENV') === 'development',
 });

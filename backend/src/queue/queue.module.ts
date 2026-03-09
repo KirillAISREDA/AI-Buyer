@@ -21,6 +21,7 @@ import { NotificationsModule } from '../notifications/notifications.module.js';
           connection: {
             host: parsed.hostname,
             port: parseInt(parsed.port || '6379', 10),
+            password: parsed.password || undefined,
           },
         };
       },
