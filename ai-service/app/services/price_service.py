@@ -129,7 +129,10 @@ async def _step1_web_search(
     items_text: str,
     items_count: int,
 ) -> tuple[str, list[dict], int]:
-    """Step 1: Call gpt-4o-mini-search-preview with web_search_options.
+    """Step 1: Call gpt-4o-mini-search-preview via Chat Completions API.
+
+    Search-preview models have built-in web search. They return text
+    with url_citation annotations on the message object.
 
     Returns (response_text, annotations_list, tokens).
     """
@@ -139,45 +142,37 @@ async def _step1_web_search(
 
     logger.info("web_search_step1", model=model, items_count=items_count)
 
-    response = await llm.responses.create(
+    response = await llm.chat.completions.create(
         model=model,
-        web_search_options={
-            "search_context_size": "medium",
-            "user_location": {
-                "type": "approximate",
-                "country": "RU",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Ты аналитик закупок. Найди реальные цены на товары "
+                    "в российских интернет-магазинах. Приведи конкретные "
+                    "цены, ссылки и названия магазинов."
+                ),
             },
-        },
-        instructions=(
-            "Ты аналитик закупок. Используй веб-поиск чтобы найти "
-            "реальные цены на товары в российских интернет-магазинах. "
-            "Приведи конкретные цены, ссылки и названия магазинов."
-        ),
-        input=prompt,
-        temperature=0.2,
+            {"role": "user", "content": prompt},
+        ],
     )
 
-    # Extract text and url_citation annotations
-    content_text = ""
-    annotations: list[dict] = []
+    msg = response.choices[0].message
+    content_text = msg.content or ""
 
-    for item in response.output:
-        if item.type == "message":
-            for block in item.content:
-                if block.type == "output_text":
-                    content_text += block.text
-                    if hasattr(block, "annotations") and block.annotations:
-                        for ann in block.annotations:
-                            ann_data: dict = {"type": getattr(ann, "type", "")}
-                            if hasattr(ann, "url") and ann.url:
-                                ann_data["url"] = ann.url
-                            if hasattr(ann, "title") and ann.title:
-                                ann_data["title"] = ann.title
-                            if hasattr(ann, "start_index"):
-                                ann_data["start_index"] = ann.start_index
-                            if hasattr(ann, "end_index"):
-                                ann_data["end_index"] = ann.end_index
-                            annotations.append(ann_data)
+    # Extract url_citation annotations
+    annotations: list[dict] = []
+    if hasattr(msg, "annotations") and msg.annotations:
+        for ann in msg.annotations:
+            ann_data: dict = {"type": getattr(ann, "type", "")}
+            # url_citation annotations have a nested url_citation object
+            citation = getattr(ann, "url_citation", None)
+            if citation:
+                ann_data["url"] = getattr(citation, "url", "")
+                ann_data["title"] = getattr(citation, "title", "")
+                ann_data["start_index"] = getattr(citation, "start_index", 0)
+                ann_data["end_index"] = getattr(citation, "end_index", 0)
+            annotations.append(ann_data)
 
     tokens = response.usage.total_tokens if response.usage else 0
 
