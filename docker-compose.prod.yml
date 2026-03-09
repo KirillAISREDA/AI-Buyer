@@ -92,6 +92,8 @@ services:
     environment:
       OPENAI_API_KEY: ${OPENAI_API_KEY}
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o}
+      PERPLEXITY_API_KEY: ${PERPLEXITY_API_KEY:-}
+      PERPLEXITY_MODEL: ${PERPLEXITY_MODEL:-sonar}
       LOG_LEVEL: ${LOG_LEVEL:-info}
 
   frontend:
